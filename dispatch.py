@@ -1,10 +1,10 @@
 """
-Claude + Codex Task Dispatcher with Rich TUI Dashboard
+Hive — Multi-Agent Task Dispatcher
 
 Task file format (.md) with optional YAML frontmatter:
   ---
   backend: claude | codex
-  model: haiku | sonnet | opus | o3-mini | o4-mini | o3
+  model: haiku | sonnet | opus | gpt-5.4 | gpt-5.3-codex
   difficulty: low | medium | high
   priority: 1          (lower = runs first)
   timeout: 300         (seconds, default 600)
@@ -45,7 +45,7 @@ DEFAULT_TIMEOUT = 600
 # Shared state
 lock = threading.Lock()
 task_states: dict[str, dict] = {}
-cost_tracker = {"claude": 0.0, "codex": 0.0, "tasks_done": 0, "tasks_total": 0}
+cost_tracker = {"claude": 0.0, "codex": 0.0, "tasks_done": 0, "tasks_failed": 0, "tasks_total": 0}
 
 
 def update_state(name: str, **kwargs):
@@ -53,10 +53,12 @@ def update_state(name: str, **kwargs):
         task_states[name].update(kwargs)
 
 
-def add_cost(backend: str, cost: float):
+def add_cost(backend: str, cost: float, failed: bool = False):
     with lock:
         cost_tracker[backend] += cost
         cost_tracker["tasks_done"] += 1
+        if failed:
+            cost_tracker["tasks_failed"] += 1
 
 
 # ── Task parsing ──────────────────────────────────────────────
@@ -67,7 +69,6 @@ def parse_task(task_file: Path) -> dict:
     meta = {}
     prompt = text
 
-    # Parse YAML frontmatter (--- ... ---)
     m = re.match(r"^---\s*\n(.*?)\n---\s*\n?(.*)", text, re.DOTALL)
     if m:
         for line in m.group(1).strip().split("\n"):
@@ -75,12 +76,6 @@ def parse_task(task_file: Path) -> dict:
                 k, v = line.split(":", 1)
                 meta[k.strip()] = v.strip()
         prompt = m.group(2).strip()
-
-    # Fallback: legacy <!-- backend: xxx --> format
-    if not meta and prompt.startswith("<!-- backend:"):
-        first_line, rest = prompt.split("\n", 1)
-        meta["backend"] = first_line.split("backend:")[1].replace("-->", "").strip()
-        prompt = rest.strip()
 
     return {
         "name": task_file.stem,
@@ -95,8 +90,6 @@ def parse_task(task_file: Path) -> dict:
 
 
 # ── Dashboard ─────────────────────────────────────────────────
-
-DIFFICULTY_STYLE = {"low": "green", "medium": "yellow", "high": "red"}
 
 def build_dashboard() -> Panel:
     with lock:
@@ -118,9 +111,10 @@ def build_dashboard() -> Panel:
         start = s.get("start_time")
         cost = s.get("cost_usd", 0)
         diff = s.get("difficulty", "")
+        diff_style = {"low": "green", "medium": "yellow", "high": "red"}.get(diff, "dim")
 
         backend_txt = Text(backend, style="cyan" if backend == "claude" else "magenta")
-        model_txt = Text(model or "-", style=DIFFICULTY_STYLE.get(diff, "dim"))
+        model_txt = Text(model or "-", style=diff_style)
 
         if status == "queued":
             badge = Text(".. queued", style="dim")
@@ -146,12 +140,15 @@ def build_dashboard() -> Panel:
 
     # Summary
     done = costs["tasks_done"]
+    failed = costs["tasks_failed"]
     total = costs["tasks_total"]
     claude_cost = costs["claude"]
     codex_cost = costs["codex"]
     total_cost = claude_cost + codex_cost
 
     parts = [f"[bold]{done}/{total}[/bold] done"]
+    if failed:
+        parts.append(f"[red]{failed} failed[/red]")
     if claude_cost:
         parts.append(f"Claude: [cyan]${claude_cost:.4f}[/cyan]")
     if codex_cost:
@@ -159,15 +156,14 @@ def build_dashboard() -> Panel:
     if total_cost:
         parts.append(f"Total: [bold]${total_cost:.4f}[/bold]")
 
-    return Panel(table, title="Claude + Codex Dispatch", subtitle="  |  ".join(parts),
+    return Panel(table, title="Hive Dispatch", subtitle="  |  ".join(parts),
                  border_style="bright_blue")
 
 
 # ── CLI runners ───────────────────────────────────────────────
 
 def run_claude(prompt: str, model: str, timeout: int) -> subprocess.CompletedProcess:
-    claude_bin = "claude"
-    cmd = [claude_bin, "-p", "--output-format", "json"]
+    cmd = ["claude", "-p", "--output-format", "json"]
     if model:
         cmd += ["--model", model]
     cmd.append(prompt)
@@ -218,18 +214,25 @@ def run_task(task: dict) -> dict:
             return {"task": name, "backend": backend, "model": model,
                     "status": "ok", "elapsed_s": elapsed, "cost_usd": cost, "result": data}
         else:
-            add_cost(backend, 0)
+            add_cost(backend, 0, failed=True)
             update_state(name, status="error", elapsed_s=elapsed)
             return {"task": name, "backend": backend, "model": model,
                     "status": "error", "elapsed_s": elapsed, "stderr": result.stderr}
 
-    except subprocess.TimeoutExpired:
-        add_cost(backend, 0)
+    except subprocess.TimeoutExpired as e:
+        # Kill the hanging process on timeout
+        if e.cmd and hasattr(e, 'args'):
+            try:
+                import signal
+                os.killpg(os.getpgid(e.cmd.pid), signal.SIGTERM)
+            except Exception:
+                pass
+        add_cost(backend, 0, failed=True)
         update_state(name, status="timeout", elapsed_s=timeout)
         return {"task": name, "backend": backend, "model": model,
                 "status": "timeout", "elapsed_s": timeout}
     except Exception as e:
-        add_cost(backend, 0)
+        add_cost(backend, 0, failed=True)
         update_state(name, status="exception",
                      elapsed_s=round(time.time() - start, 1))
         return {"task": name, "backend": backend, "model": model,
@@ -262,7 +265,7 @@ def main():
         }
     cost_tracker["tasks_total"] = len(tasks)
 
-    console = Console(force_terminal=True)
+    console = Console()
     console.print(f"\n[bold]Dispatching {len(tasks)} tasks (max {max_workers} parallel)[/bold]\n")
 
     with Live(build_dashboard(), console=console, refresh_per_second=2) as live:

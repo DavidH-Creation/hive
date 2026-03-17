@@ -3,26 +3,22 @@
 Multi-agent task dispatcher for Claude CLI + OpenAI Codex CLI with a live Rich TUI dashboard.
 
 ```
-Desktop (plan) --> tasks/*.md --> dispatch.py --> results/*.json --> Desktop (review)
+You (plan) --> tasks/*.md --> dispatch.py --> results/*.json --> You (review)
 ```
-
-## What it does
-
-- Break complex work into independent subtasks as `.md` files
-- Dispatch them in parallel across Claude and Codex CLI backends
-- Monitor progress with a live terminal dashboard (status, time, cost)
-- Collect structured JSON results for review
 
 ## Quick start
 
 ```bash
-pip install rich
+git clone https://github.com/DavidH-Creation/hive.git
 cd hive
-python dispatch.py        # run all tasks
+pip install rich
+python dispatch.py        # run all tasks in tasks/
 python dispatch.py 3      # limit to 3 concurrent
 ```
 
 ## Task format
+
+Create `.md` files in `tasks/` with optional YAML frontmatter:
 
 ```markdown
 ---
@@ -32,21 +28,23 @@ difficulty: medium
 priority: 1
 timeout: 300
 ---
-Your prompt here. Be specific.
+Your prompt here. Be specific — include file paths and context.
 ```
 
 | Field | Default | Options |
 |-------|---------|---------|
 | backend | claude | `claude`, `codex` |
 | model | (default) | Claude: `haiku`/`sonnet`/`opus` — Codex: `gpt-5.4`/`gpt-5.3-codex` |
-| difficulty | - | `low`/`medium`/`high` |
+| difficulty | - | `low`/`medium`/`high` (shown in dashboard) |
 | priority | 99 | Lower = runs first |
 | timeout | 600 | Seconds |
+
+See `tasks/examples/` for sample task files.
 
 ## Dashboard
 
 ```
-+------------------ Claude + Codex Dispatch -------------------+
++----------------------- Hive Dispatch ------------------------+
 | Task            | Back  | Model  | Status  | Time  | Cost    |
 |-----------------+-------+--------+---------+-------+---------|
 | review-code     | claude| sonnet | OK done | 18.0s | $0.0396 |
@@ -56,13 +54,17 @@ Your prompt here. Be specific.
          2/3 done  |  Claude: $0.0396  |  Total: $0.0396
 ```
 
-## As a Claude Code skill
+## Use as a Claude Code skill
 
-Copy the `hive/` directory into your skills path and it becomes available as a skill. See `SKILL.md` for the full workflow.
+Copy the `hive/` directory into your Claude Code skills path. The skill triggers when you ask to dispatch parallel tasks, fan out work, or mention "hive". See `SKILL.md` for the full workflow.
 
 ## Requirements
 
 - Python 3.10+
-- `rich` (`pip install rich`)
-- `claude` CLI on PATH
-- `codex` CLI on PATH (optional, for Codex tasks)
+- [rich](https://github.com/Textualize/rich) (`pip install rich`)
+- [Claude CLI](https://docs.anthropic.com/en/docs/claude-code) on PATH
+- [Codex CLI](https://github.com/openai/codex) on PATH (optional, for Codex backend tasks)
+
+## License
+
+MIT
