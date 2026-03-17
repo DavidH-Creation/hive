@@ -6,30 +6,34 @@ Task file format (.md) with optional YAML frontmatter:
   backend: claude | codex
   model: haiku | sonnet | opus | gpt-5.4 | gpt-5.3-codex
   difficulty: low | medium | high
-  priority: 1          (lower = runs first)
+  priority: 1          (lower = runs first, same priority = parallel)
   timeout: 300         (seconds, default 600)
   ---
   Your prompt here...
 
 Usage:
-  python dispatch.py           # run all, full parallelism
-  python dispatch.py 3         # limit to 3 concurrent
+  python dispatch.py                     # all tasks, full parallelism
+  python dispatch.py --workers 3         # limit concurrency
+  python dispatch.py --tasks-dir ./my    # custom task directory
 """
 
+import argparse
+import itertools
 import os
-import subprocess
 import json
 import re
+import shutil
+import subprocess
 import sys
 import time
 import threading
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# Fix Windows encoding: force UTF-8 for subprocess and console
+# Fix Windows encoding
 os.environ["PYTHONIOENCODING"] = "utf-8"
 if sys.platform == "win32":
-    os.system("")  # enable VT100 escape sequences on Windows
+    os.system("")  # enable VT100 escape sequences
 
 from rich.live import Live
 from rich.table import Table
@@ -37,10 +41,8 @@ from rich.console import Console
 from rich.text import Text
 from rich.panel import Panel
 
-ROOT = Path(__file__).parent
-TASKS_DIR = ROOT / "tasks"
-RESULTS_DIR = ROOT / "results"
 DEFAULT_TIMEOUT = 600
+VALID_BACKENDS = {"claude", "codex"}
 
 # Shared state
 lock = threading.Lock()
@@ -61,10 +63,27 @@ def add_cost(backend: str, cost: float, failed: bool = False):
             cost_tracker["tasks_failed"] += 1
 
 
+# ── Preflight ─────────────────────────────────────────────────
+
+def preflight(tasks: list[dict]) -> list[str]:
+    """Check that required CLI tools are on PATH. Returns list of errors."""
+    needed = {t["backend"] for t in tasks}
+    errors = []
+    for backend in needed:
+        if backend == "claude":
+            if not shutil.which("claude"):
+                errors.append("'claude' CLI not found on PATH")
+        elif backend == "codex":
+            bin_name = "codex.cmd" if sys.platform == "win32" else "codex"
+            if not shutil.which(bin_name):
+                errors.append(f"'{bin_name}' CLI not found on PATH")
+    return errors
+
+
 # ── Task parsing ──────────────────────────────────────────────
 
 def parse_task(task_file: Path) -> dict:
-    """Parse .md with optional YAML frontmatter. Returns task config dict."""
+    """Parse .md with simple key: value frontmatter. Returns task config dict."""
     text = task_file.read_text(encoding="utf-8").strip()
     meta = {}
     prompt = text
@@ -77,14 +96,29 @@ def parse_task(task_file: Path) -> dict:
                 meta[k.strip()] = v.strip()
         prompt = m.group(2).strip()
 
+    # Validate backend
+    backend = meta.get("backend", "claude").lower()
+    if backend not in VALID_BACKENDS:
+        raise ValueError(f"{task_file.name}: invalid backend '{backend}' (must be one of {VALID_BACKENDS})")
+
+    # Validate numeric fields
+    try:
+        priority = int(meta.get("priority", 99))
+    except ValueError:
+        raise ValueError(f"{task_file.name}: priority must be an integer, got '{meta['priority']}'")
+    try:
+        timeout = int(meta.get("timeout", DEFAULT_TIMEOUT))
+    except ValueError:
+        raise ValueError(f"{task_file.name}: timeout must be an integer, got '{meta['timeout']}'")
+
     return {
         "name": task_file.stem,
         "file": task_file,
-        "backend": meta.get("backend", "claude").lower(),
+        "backend": backend,
         "model": meta.get("model", ""),
         "difficulty": meta.get("difficulty", ""),
-        "priority": int(meta.get("priority", 99)),
-        "timeout": int(meta.get("timeout", DEFAULT_TIMEOUT)),
+        "priority": priority,
+        "timeout": timeout,
         "prompt": prompt,
     }
 
@@ -160,23 +194,86 @@ def build_dashboard() -> Panel:
                  border_style="bright_blue")
 
 
-# ── CLI runners ───────────────────────────────────────────────
+# ── CLI runners (Popen-based for proper timeout + kill) ───────
 
-def run_claude(prompt: str, model: str, timeout: int) -> subprocess.CompletedProcess:
+def run_process(cmd: list[str], timeout: int) -> dict:
+    """Run a command with Popen. Returns dict with stdout, stderr, returncode."""
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    try:
+        stdout_bytes, stderr_bytes = proc.communicate(timeout=timeout)
+        return {
+            "stdout": stdout_bytes.decode("utf-8", errors="replace"),
+            "stderr": stderr_bytes.decode("utf-8", errors="replace"),
+            "returncode": proc.returncode,
+            "timed_out": False,
+        }
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+        return {
+            "stdout": "",
+            "stderr": "",
+            "returncode": -1,
+            "timed_out": True,
+        }
+
+
+def build_claude_cmd(prompt: str, model: str) -> list[str]:
     cmd = ["claude", "-p", "--output-format", "json"]
     if model:
         cmd += ["--model", model]
     cmd.append(prompt)
-    return subprocess.run(cmd, capture_output=True, timeout=timeout, encoding="utf-8", errors="replace")
+    return cmd
 
 
-def run_codex(prompt: str, model: str, timeout: int) -> subprocess.CompletedProcess:
+def build_codex_cmd(prompt: str, model: str) -> list[str]:
     codex_bin = "codex.cmd" if sys.platform == "win32" else "codex"
     cmd = [codex_bin, "exec", "--json", "--skip-git-repo-check"]
     if model:
         cmd += ["-m", model]
     cmd.append(prompt)
-    return subprocess.run(cmd, capture_output=True, timeout=timeout, encoding="utf-8", errors="replace")
+    return cmd
+
+
+# ── Output parsing ────────────────────────────────────────────
+
+def parse_claude_output(stdout: str) -> dict:
+    """Claude --output-format json returns a single JSON object."""
+    try:
+        return json.loads(stdout)
+    except json.JSONDecodeError:
+        return {"raw_output": stdout}
+
+
+def parse_codex_output(stdout: str) -> dict:
+    """Codex --json returns JSONL (one JSON object per line).
+    We collect all events and extract the final agent message."""
+    events = []
+    for line in stdout.strip().split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            events.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+
+    if not events:
+        return {"raw_output": stdout}
+
+    # Extract the final agent message and usage from events
+    result = {"events": events}
+    for event in events:
+        if event.get("type") == "item.completed":
+            item = event.get("item", {})
+            if item.get("type") == "agent_message":
+                result["message"] = item.get("text", "")
+        elif event.get("type") == "turn.completed":
+            result["usage"] = event.get("usage", {})
+
+    return result
 
 
 # ── Task execution ────────────────────────────────────────────
@@ -193,67 +290,118 @@ def run_task(task: dict) -> dict:
 
     try:
         if backend == "codex":
-            result = run_codex(prompt, model, timeout)
+            cmd = build_codex_cmd(prompt, model)
         else:
-            result = run_claude(prompt, model, timeout)
+            cmd = build_claude_cmd(prompt, model)
 
+        proc_result = run_process(cmd, timeout)
         elapsed = round(time.time() - start, 1)
 
-        if result.returncode == 0:
-            try:
-                data = json.loads(result.stdout)
-            except json.JSONDecodeError:
-                data = {"raw_output": result.stdout}
+        # Base result with full stdout/stderr preserved
+        result = {
+            "task": name,
+            "backend": backend,
+            "model": model,
+            "elapsed_s": elapsed,
+            "exit_code": proc_result["returncode"],
+            "stdout": proc_result["stdout"],
+            "stderr": proc_result["stderr"],
+        }
 
+        if proc_result["timed_out"]:
+            add_cost(backend, 0, failed=True)
+            update_state(name, status="timeout", elapsed_s=timeout)
+            result["status"] = "timeout"
+            result["elapsed_s"] = timeout
+            return result
+
+        # Parse output based on backend
+        if backend == "codex":
+            parsed = parse_codex_output(proc_result["stdout"])
+        else:
+            parsed = parse_claude_output(proc_result["stdout"])
+
+        result["parsed_output"] = parsed
+
+        if proc_result["returncode"] == 0:
             cost = 0.0
-            if backend == "claude" and isinstance(data, dict):
-                cost = data.get("total_cost_usd", 0) or 0
-
+            if backend == "claude" and isinstance(parsed, dict):
+                cost = parsed.get("total_cost_usd", 0) or 0
             add_cost(backend, cost)
             update_state(name, status="ok", elapsed_s=elapsed, cost_usd=cost)
-            return {"task": name, "backend": backend, "model": model,
-                    "status": "ok", "elapsed_s": elapsed, "cost_usd": cost, "result": data}
+            result["status"] = "ok"
+            result["cost_usd"] = cost
         else:
             add_cost(backend, 0, failed=True)
             update_state(name, status="error", elapsed_s=elapsed)
-            return {"task": name, "backend": backend, "model": model,
-                    "status": "error", "elapsed_s": elapsed, "stderr": result.stderr}
+            result["status"] = "error"
 
-    except subprocess.TimeoutExpired as e:
-        # Kill the hanging process on timeout
-        if e.cmd and hasattr(e, 'args'):
-            try:
-                import signal
-                os.killpg(os.getpgid(e.cmd.pid), signal.SIGTERM)
-            except Exception:
-                pass
-        add_cost(backend, 0, failed=True)
-        update_state(name, status="timeout", elapsed_s=timeout)
-        return {"task": name, "backend": backend, "model": model,
-                "status": "timeout", "elapsed_s": timeout}
+        return result
+
     except Exception as e:
+        elapsed = round(time.time() - start, 1)
         add_cost(backend, 0, failed=True)
-        update_state(name, status="exception",
-                     elapsed_s=round(time.time() - start, 1))
-        return {"task": name, "backend": backend, "model": model,
-                "status": "exception", "error": str(e)}
+        update_state(name, status="exception", elapsed_s=elapsed)
+        return {
+            "task": name, "backend": backend, "model": model,
+            "status": "exception", "elapsed_s": elapsed,
+            "exit_code": -1, "stdout": "", "stderr": "",
+            "error": str(e),
+        }
+
+
+# ── Priority batch execution ─────────────────────────────────
+
+def run_batch(batch: list[dict], max_workers: int, console: Console, live: Live):
+    """Run a batch of same-priority tasks in parallel."""
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {pool.submit(run_task, t): t["name"] for t in batch}
+        while any(not f.done() for f in futures):
+            live.update(build_dashboard())
+            time.sleep(0.5)
+        live.update(build_dashboard())
+        return [f.result() for f in futures]
 
 
 # ── Main ──────────────────────────────────────────────────────
 
 def main():
-    RESULTS_DIR.mkdir(exist_ok=True)
+    parser = argparse.ArgumentParser(description="Hive — Multi-Agent Task Dispatcher")
+    parser.add_argument("--workers", "-w", type=int, default=0,
+                        help="Max concurrent tasks (default: all)")
+    parser.add_argument("--tasks-dir", "-t", type=Path, default=None,
+                        help="Tasks directory (default: ./tasks)")
+    parser.add_argument("--results-dir", "-r", type=Path, default=None,
+                        help="Results directory (default: ./results)")
+    args = parser.parse_args()
 
-    task_files = sorted(TASKS_DIR.glob("*.md"))
+    root = Path(__file__).parent
+    tasks_dir = args.tasks_dir or (root / "tasks")
+    results_dir = args.results_dir or (root / "results")
+    results_dir.mkdir(exist_ok=True)
+
+    task_files = sorted(tasks_dir.glob("*.md"))
     if not task_files:
-        print("No .md task files found in tasks/")
+        print(f"No .md task files found in {tasks_dir}")
         sys.exit(1)
 
-    # Parse and sort by priority
+    # Parse all tasks (exits on validation error)
     tasks = [parse_task(f) for f in task_files]
-    tasks.sort(key=lambda t: t["priority"])
 
-    max_workers = int(sys.argv[1]) if len(sys.argv) > 1 else len(tasks)
+    # Preflight: check CLIs are available
+    errors = preflight(tasks)
+    if errors:
+        for e in errors:
+            print(f"Error: {e}")
+        sys.exit(1)
+
+    # Group by priority for batch execution
+    tasks.sort(key=lambda t: t["priority"])
+    batches = []
+    for _, group in itertools.groupby(tasks, key=lambda t: t["priority"]):
+        batches.append(list(group))
+
+    max_workers = args.workers or len(tasks)
 
     # Init dashboard state
     for t in tasks:
@@ -266,27 +414,28 @@ def main():
     cost_tracker["tasks_total"] = len(tasks)
 
     console = Console()
-    console.print(f"\n[bold]Dispatching {len(tasks)} tasks (max {max_workers} parallel)[/bold]\n")
+    n_batches = len(batches)
+    batch_info = f" in {n_batches} priority batch{'es' if n_batches > 1 else ''}" if n_batches > 1 else ""
+    console.print(f"\n[bold]Dispatching {len(tasks)} tasks{batch_info} (max {max_workers} parallel)[/bold]\n")
 
+    all_results = []
     with Live(build_dashboard(), console=console, refresh_per_second=2) as live:
-        with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            futures = {pool.submit(run_task, t): t["name"] for t in tasks}
+        for batch in batches:
+            results = run_batch(batch, max_workers, console, live)
+            all_results.extend(results)
 
-            while any(not f.done() for f in futures):
-                live.update(build_dashboard())
-                time.sleep(0.5)
+    # Save results
+    for result in all_results:
+        out_path = results_dir / f"{result['task']}.json"
+        out_path.write_text(
+            json.dumps(result, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
 
-            live.update(build_dashboard())
-
-            for future in futures:
-                result = future.result()
-                out_path = RESULTS_DIR / f"{result['task']}.json"
-                out_path.write_text(
-                    json.dumps(result, indent=2, ensure_ascii=False),
-                    encoding="utf-8",
-                )
-
-    console.print("\n[bold green]Done.[/bold green] Results saved to results/\n")
+    # Exit code: 0 if all ok, 1 if any failures
+    has_failures = any(r["status"] != "ok" for r in all_results)
+    console.print(f"\n[bold green]Done.[/bold green] Results saved to {results_dir}/\n")
+    sys.exit(1 if has_failures else 0)
 
 
 if __name__ == "__main__":
