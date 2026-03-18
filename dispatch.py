@@ -1,5 +1,5 @@
 """
-Hive — Multi-Agent Task Dispatcher
+Hive -- Multi-Agent Task Dispatcher
 
 Task file format (.md) with optional YAML frontmatter:
   ---
@@ -8,16 +8,25 @@ Task file format (.md) with optional YAML frontmatter:
   difficulty: low | medium | high
   priority: 1          (lower = runs first, same priority = parallel)
   timeout: 300         (seconds, default 600)
+  worktree: true       (run in isolated git worktree)
   ---
   Your prompt here...
 
+Dynamic task spawning:
+  Agents can spawn new tasks by printing to stdout:
+  HIVE_SPAWN: {"name": "sub-task", "prompt": "...", "backend": "claude"}
+
 Usage:
-  python dispatch.py                     # all tasks, full parallelism
-  python dispatch.py --workers 3         # limit concurrency
-  python dispatch.py --tasks-dir ./my    # custom task directory
+  python dispatch.py                          # all tasks, full parallelism
+  python dispatch.py --workers 3              # limit concurrency
+  python dispatch.py --tasks-dir ./my         # custom task directory
+  python dispatch.py --web                    # enable web dashboard
+  python dispatch.py --web --port 9090        # custom port
+  python dispatch.py --worktree              # enable git worktree isolation
 """
 
 import argparse
+import http.server
 import itertools
 import os
 import json
@@ -27,6 +36,7 @@ import subprocess
 import sys
 import time
 import threading
+import webbrowser
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -42,12 +52,17 @@ from rich.text import Text
 from rich.panel import Panel
 
 DEFAULT_TIMEOUT = 600
+DEFAULT_WEB_PORT = 8686
 VALID_BACKENDS = {"claude", "codex"}
 
 # Shared state
 lock = threading.Lock()
 task_states: dict[str, dict] = {}
-cost_tracker = {"claude": 0.0, "codex": 0.0, "tasks_done": 0, "tasks_failed": 0, "tasks_total": 0}
+cost_tracker = {
+    "claude": 0.0, "codex": 0.0,
+    "tasks_done": 0, "tasks_failed": 0, "tasks_total": 0,
+}
+dynamic_tasks: list[dict] = []
 
 
 def update_state(name: str, **kwargs):
@@ -63,7 +78,7 @@ def add_cost(backend: str, cost: float, failed: bool = False):
             cost_tracker["tasks_failed"] += 1
 
 
-# ── Preflight ─────────────────────────────────────────────────
+# -- Preflight ---------------------------------------------------------------
 
 def preflight(tasks: list[dict]) -> list[str]:
     """Check that required CLI tools are on PATH. Returns list of errors."""
@@ -80,7 +95,7 @@ def preflight(tasks: list[dict]) -> list[str]:
     return errors
 
 
-# ── Task parsing ──────────────────────────────────────────────
+# -- Task parsing -------------------------------------------------------------
 
 def parse_task(task_file: Path) -> dict:
     """Parse .md with simple key: value frontmatter. Returns task config dict."""
@@ -99,17 +114,26 @@ def parse_task(task_file: Path) -> dict:
     # Validate backend
     backend = meta.get("backend", "claude").lower()
     if backend not in VALID_BACKENDS:
-        raise ValueError(f"{task_file.name}: invalid backend '{backend}' (must be one of {VALID_BACKENDS})")
+        raise ValueError(
+            f"{task_file.name}: invalid backend '{backend}' "
+            f"(must be one of {VALID_BACKENDS})"
+        )
 
     # Validate numeric fields
     try:
         priority = int(meta.get("priority", 99))
     except ValueError:
-        raise ValueError(f"{task_file.name}: priority must be an integer, got '{meta['priority']}'")
+        raise ValueError(
+            f"{task_file.name}: priority must be an integer, got '{meta['priority']}'"
+        )
     try:
         timeout = int(meta.get("timeout", DEFAULT_TIMEOUT))
     except ValueError:
-        raise ValueError(f"{task_file.name}: timeout must be an integer, got '{meta['timeout']}'")
+        raise ValueError(
+            f"{task_file.name}: timeout must be an integer, got '{meta['timeout']}'"
+        )
+
+    worktree = meta.get("worktree", "").lower() in ("true", "yes", "1")
 
     return {
         "name": task_file.stem,
@@ -119,11 +143,167 @@ def parse_task(task_file: Path) -> dict:
         "difficulty": meta.get("difficulty", ""),
         "priority": priority,
         "timeout": timeout,
+        "worktree": worktree,
         "prompt": prompt,
     }
 
 
-# ── Dashboard ─────────────────────────────────────────────────
+# -- Dynamic task spawning ----------------------------------------------------
+
+def scan_for_spawns(stdout: str, source_task: str) -> list[dict]:
+    """Scan agent stdout for HIVE_SPAWN directives. Returns list of task dicts."""
+    spawns = []
+    for line in stdout.split("\n"):
+        line = line.strip()
+        if not line.startswith("HIVE_SPAWN:"):
+            continue
+        try:
+            payload = json.loads(line[len("HIVE_SPAWN:"):].strip())
+            name = payload.get("name", f"spawn-{source_task}-{len(spawns)}")
+            backend = payload.get("backend", "claude").lower()
+            prompt = payload.get("prompt", "")
+            if not prompt or backend not in VALID_BACKENDS:
+                continue
+            spawns.append({
+                "name": name,
+                "file": None,
+                "backend": backend,
+                "model": payload.get("model", ""),
+                "difficulty": payload.get("difficulty", ""),
+                "priority": int(payload.get("priority", 99)),
+                "timeout": int(payload.get("timeout", DEFAULT_TIMEOUT)),
+                "worktree": bool(payload.get("worktree", False)),
+                "prompt": prompt,
+                "spawned_by": source_task,
+            })
+        except (json.JSONDecodeError, ValueError, TypeError):
+            continue
+    return spawns
+
+
+# -- Git worktree isolation ---------------------------------------------------
+
+def detect_git_root() -> str | None:
+    """Return the git repo root if CWD is inside a git repo, else None."""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+    except Exception:
+        pass
+    return None
+
+
+def create_worktree(task_name: str, git_root: str) -> str | None:
+    """Create a git worktree for the task. Returns worktree path or None."""
+    wt_base = Path(git_root) / ".hive" / "worktrees"
+    wt_base.mkdir(parents=True, exist_ok=True)
+    wt_path = wt_base / task_name
+    branch = f"hive/{task_name}"
+    try:
+        subprocess.run(
+            ["git", "worktree", "add", "-b", branch, str(wt_path)],
+            capture_output=True, timeout=30, check=True, cwd=git_root,
+        )
+        return str(wt_path)
+    except subprocess.CalledProcessError:
+        try:
+            subprocess.run(
+                ["git", "worktree", "add", "--detach", str(wt_path)],
+                capture_output=True, timeout=30, check=True, cwd=git_root,
+            )
+            return str(wt_path)
+        except Exception:
+            return None
+
+
+def remove_worktree(wt_path: str, git_root: str):
+    """Remove a git worktree."""
+    try:
+        subprocess.run(
+            ["git", "worktree", "remove", "--force", wt_path],
+            capture_output=True, timeout=30, cwd=git_root,
+        )
+    except Exception:
+        pass
+
+
+# -- Web dashboard ------------------------------------------------------------
+
+class DashboardHandler(http.server.BaseHTTPRequestHandler):
+    """Serves dashboard.html and SSE event stream."""
+
+    def do_GET(self):
+        if self.path in ("/", "/index.html"):
+            self._serve_html()
+        elif self.path == "/api/events":
+            self._serve_sse()
+        elif self.path == "/api/state":
+            self._serve_json()
+        else:
+            self.send_error(404)
+
+    def _serve_html(self):
+        html_path = Path(__file__).parent / "dashboard.html"
+        if not html_path.exists():
+            self.send_error(500, "dashboard.html not found")
+            return
+        content = html_path.read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(content)))
+        self.end_headers()
+        self.wfile.write(content)
+
+    def _serve_json(self):
+        with lock:
+            data = json.dumps({
+                "tasks": dict(task_states),
+                "costs": dict(cost_tracker),
+            })
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(data.encode())
+
+    def _serve_sse(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        try:
+            while True:
+                with lock:
+                    data = {
+                        "tasks": dict(task_states),
+                        "costs": dict(cost_tracker),
+                    }
+                payload = f"data: {json.dumps(data)}\n\n"
+                self.wfile.write(payload.encode())
+                self.wfile.flush()
+                time.sleep(1)
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
+
+    def log_message(self, format, *args):
+        pass  # suppress request logging
+
+
+def start_web_server(port: int) -> http.server.HTTPServer:
+    """Start the web dashboard server in a daemon thread."""
+    server = http.server.ThreadingHTTPServer(("", port), DashboardHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server
+
+
+# -- Dashboard (Rich TUI) ----------------------------------------------------
 
 def build_dashboard() -> Panel:
     with lock:
@@ -145,9 +325,15 @@ def build_dashboard() -> Panel:
         start = s.get("start_time")
         cost = s.get("cost_usd", 0)
         diff = s.get("difficulty", "")
-        diff_style = {"low": "green", "medium": "yellow", "high": "red"}.get(diff, "dim")
+        diff_style = {"low": "green", "medium": "yellow", "high": "red"}.get(
+            diff, "dim"
+        )
+        spawned = s.get("spawned_by")
+        task_label = f"  > {name}" if spawned else name
 
-        backend_txt = Text(backend, style="cyan" if backend == "claude" else "magenta")
+        backend_txt = Text(
+            backend, style="cyan" if backend == "claude" else "magenta"
+        )
         model_txt = Text(model or "-", style=diff_style)
 
         if status == "queued":
@@ -164,13 +350,20 @@ def build_dashboard() -> Panel:
             elapsed_txt = Text(f"{s.get('elapsed_s', 0):.1f}s", style="red")
         elif status == "timeout":
             badge = Text("!! timeout", style="bold red")
-            elapsed_txt = Text(f"{s.get('timeout', DEFAULT_TIMEOUT)}s", style="red")
+            elapsed_txt = Text(
+                f"{s.get('timeout', DEFAULT_TIMEOUT)}s", style="red"
+            )
         else:
             badge = Text(status, style="bold magenta")
             elapsed_txt = Text("-")
 
-        cost_txt = Text(f"${cost:.4f}" if cost else "-", style="dim" if not cost else "")
-        table.add_row(name, backend_txt, model_txt, badge, elapsed_txt, cost_txt)
+        cost_txt = Text(
+            f"${cost:.4f}" if cost else "-",
+            style="dim" if not cost else "",
+        )
+        table.add_row(
+            task_label, backend_txt, model_txt, badge, elapsed_txt, cost_txt
+        )
 
     # Summary
     done = costs["tasks_done"]
@@ -190,16 +383,20 @@ def build_dashboard() -> Panel:
     if total_cost:
         parts.append(f"Total: [bold]${total_cost:.4f}[/bold]")
 
-    return Panel(table, title="Hive Dispatch", subtitle="  |  ".join(parts),
-                 border_style="bright_blue")
+    return Panel(
+        table,
+        title="Hive Dispatch",
+        subtitle="  |  ".join(parts),
+        border_style="bright_blue",
+    )
 
 
-# ── CLI runners (Popen-based for proper timeout + kill) ───────
+# -- CLI runners (Popen-based for proper timeout + kill) ----------------------
 
-def run_process(cmd: list[str], timeout: int) -> dict:
+def run_process(cmd: list[str], timeout: int, cwd: str = None) -> dict:
     """Run a command with Popen. Returns dict with stdout, stderr, returncode."""
     proc = subprocess.Popen(
-        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=cwd,
     )
     try:
         stdout_bytes, stderr_bytes = proc.communicate(timeout=timeout)
@@ -237,7 +434,7 @@ def build_codex_cmd(prompt: str, model: str) -> list[str]:
     return cmd
 
 
-# ── Output parsing ────────────────────────────────────────────
+# -- Output parsing -----------------------------------------------------------
 
 def parse_claude_output(stdout: str) -> dict:
     """Claude --output-format json returns a single JSON object."""
@@ -276,26 +473,39 @@ def parse_codex_output(stdout: str) -> dict:
     return result
 
 
-# ── Task execution ────────────────────────────────────────────
+# -- Task execution -----------------------------------------------------------
 
-def run_task(task: dict) -> dict:
+def run_task(task: dict, git_root: str = None) -> dict:
     name = task["name"]
     backend = task["backend"]
     model = task["model"]
     prompt = task["prompt"]
     timeout = task["timeout"]
+    use_worktree = task.get("worktree", False) and git_root is not None
+    wt_path = None
     start = time.time()
 
     update_state(name, status="running", start_time=start)
 
     try:
+        # Create worktree if enabled
+        if use_worktree:
+            wt_path = create_worktree(name, git_root)
+
         if backend == "codex":
             cmd = build_codex_cmd(prompt, model)
         else:
             cmd = build_claude_cmd(prompt, model)
 
-        proc_result = run_process(cmd, timeout)
+        proc_result = run_process(cmd, timeout, cwd=wt_path)
         elapsed = round(time.time() - start, 1)
+
+        # Scan for dynamic task spawns
+        if proc_result["stdout"]:
+            spawns = scan_for_spawns(proc_result["stdout"], name)
+            if spawns:
+                with lock:
+                    dynamic_tasks.extend(spawns)
 
         # Base result with full stdout/stderr preserved
         result = {
@@ -307,6 +517,10 @@ def run_task(task: dict) -> dict:
             "stdout": proc_result["stdout"],
             "stderr": proc_result["stderr"],
         }
+        if task.get("spawned_by"):
+            result["spawned_by"] = task["spawned_by"]
+        if wt_path:
+            result["worktree"] = wt_path
 
         if proc_result["timed_out"]:
             add_cost(backend, 0, failed=True)
@@ -348,14 +562,20 @@ def run_task(task: dict) -> dict:
             "exit_code": -1, "stdout": "", "stderr": "",
             "error": str(e),
         }
+    finally:
+        if wt_path:
+            remove_worktree(wt_path, git_root)
 
 
-# ── Priority batch execution ─────────────────────────────────
+# -- Priority batch execution -------------------------------------------------
 
-def run_batch(batch: list[dict], max_workers: int, console: Console, live: Live):
+def run_batch(batch: list[dict], max_workers: int, console: Console,
+              live: Live, git_root: str = None):
     """Run a batch of same-priority tasks in parallel."""
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        futures = {pool.submit(run_task, t): t["name"] for t in batch}
+        futures = {
+            pool.submit(run_task, t, git_root): t["name"] for t in batch
+        }
         while any(not f.done() for f in futures):
             live.update(build_dashboard())
             time.sleep(0.5)
@@ -363,16 +583,36 @@ def run_batch(batch: list[dict], max_workers: int, console: Console, live: Live)
         return [f.result() for f in futures]
 
 
-# ── Main ──────────────────────────────────────────────────────
+# -- Main ---------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="Hive — Multi-Agent Task Dispatcher")
-    parser.add_argument("--workers", "-w", type=int, default=0,
-                        help="Max concurrent tasks (default: all)")
-    parser.add_argument("--tasks-dir", "-t", type=Path, default=None,
-                        help="Tasks directory (default: ./tasks)")
-    parser.add_argument("--results-dir", "-r", type=Path, default=None,
-                        help="Results directory (default: ./results)")
+    parser = argparse.ArgumentParser(
+        description="Hive -- Multi-Agent Task Dispatcher"
+    )
+    parser.add_argument(
+        "--workers", "-w", type=int, default=0,
+        help="Max concurrent tasks (default: all)",
+    )
+    parser.add_argument(
+        "--tasks-dir", "-t", type=Path, default=None,
+        help="Tasks directory (default: ./tasks)",
+    )
+    parser.add_argument(
+        "--results-dir", "-r", type=Path, default=None,
+        help="Results directory (default: ./results)",
+    )
+    parser.add_argument(
+        "--web", action="store_true",
+        help="Enable web dashboard",
+    )
+    parser.add_argument(
+        "--port", type=int, default=DEFAULT_WEB_PORT,
+        help=f"Web dashboard port (default: {DEFAULT_WEB_PORT})",
+    )
+    parser.add_argument(
+        "--worktree", action="store_true",
+        help="Enable git worktree isolation for all tasks",
+    )
     args = parser.parse_args()
 
     root = Path(__file__).parent
@@ -387,6 +627,23 @@ def main():
 
     # Parse all tasks (exits on validation error)
     tasks = [parse_task(f) for f in task_files]
+
+    # Apply global --worktree flag
+    if args.worktree:
+        for t in tasks:
+            t["worktree"] = True
+
+    # Detect git repo for worktree support
+    git_root = None
+    if any(t.get("worktree") for t in tasks):
+        git_root = detect_git_root()
+        if not git_root:
+            print(
+                "Warning: worktree requested but not in a git repo. "
+                "Worktree isolation disabled."
+            )
+            for t in tasks:
+                t["worktree"] = False
 
     # Preflight: check CLIs are available
     errors = preflight(tasks)
@@ -413,16 +670,68 @@ def main():
         }
     cost_tracker["tasks_total"] = len(tasks)
 
+    # Start web dashboard
+    if args.web:
+        try:
+            start_web_server(args.port)
+            url = f"http://localhost:{args.port}"
+            print(f"Web dashboard: {url}")
+            try:
+                webbrowser.open(url)
+            except Exception:
+                pass
+        except OSError as e:
+            print(f"Warning: could not start web server on port {args.port}: {e}")
+
     console = Console()
     n_batches = len(batches)
-    batch_info = f" in {n_batches} priority batch{'es' if n_batches > 1 else ''}" if n_batches > 1 else ""
-    console.print(f"\n[bold]Dispatching {len(tasks)} tasks{batch_info} (max {max_workers} parallel)[/bold]\n")
+    batch_info = (
+        f" in {n_batches} priority batch{'es' if n_batches > 1 else ''}"
+        if n_batches > 1
+        else ""
+    )
+    wt_info = " [worktree]" if git_root else ""
+    console.print(
+        f"\n[bold]Dispatching {len(tasks)} tasks{batch_info}{wt_info} "
+        f"(max {max_workers} parallel)[/bold]\n"
+    )
 
     all_results = []
     with Live(build_dashboard(), console=console, refresh_per_second=2) as live:
         for batch in batches:
-            results = run_batch(batch, max_workers, console, live)
+            results = run_batch(batch, max_workers, console, live, git_root)
             all_results.extend(results)
+
+        # Process dynamically spawned tasks
+        while True:
+            with lock:
+                new_tasks = list(dynamic_tasks)
+                dynamic_tasks.clear()
+            if not new_tasks:
+                break
+
+            # Register in dashboard
+            with lock:
+                cost_tracker["tasks_total"] += len(new_tasks)
+            for t in new_tasks:
+                task_states[t["name"]] = {
+                    "status": "queued",
+                    "backend": t["backend"],
+                    "model": t["model"],
+                    "difficulty": t.get("difficulty", ""),
+                    "spawned_by": t.get("spawned_by", ""),
+                }
+            live.update(build_dashboard())
+
+            new_tasks.sort(key=lambda t: t["priority"])
+            for _, group in itertools.groupby(
+                new_tasks, key=lambda t: t["priority"]
+            ):
+                batch = list(group)
+                results = run_batch(
+                    batch, max_workers, console, live, git_root
+                )
+                all_results.extend(results)
 
     # Save results
     for result in all_results:
@@ -434,7 +743,12 @@ def main():
 
     # Exit code: 0 if all ok, 1 if any failures
     has_failures = any(r["status"] != "ok" for r in all_results)
-    console.print(f"\n[bold green]Done.[/bold green] Results saved to {results_dir}/\n")
+    n_spawned = sum(1 for r in all_results if r.get("spawned_by"))
+    spawn_info = f" ({n_spawned} dynamically spawned)" if n_spawned else ""
+    console.print(
+        f"\n[bold green]Done.[/bold green] "
+        f"{len(all_results)} results{spawn_info} saved to {results_dir}/\n"
+    )
     sys.exit(1 if has_failures else 0)
 
 

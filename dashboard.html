@@ -1,0 +1,520 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Hive Dispatch</title>
+<style>
+:root {
+  --bg: #08080d;
+  --surface: #10101a;
+  --surface-2: #181824;
+  --surface-3: #20202e;
+  --border: #28283a;
+  --text: #d8d8e4;
+  --text-dim: #5a5a70;
+  --text-muted: #3a3a4e;
+  --accent: #f0b429;
+  --accent-dim: #5c4510;
+  --claude: #22d3ee;
+  --claude-dim: #0c3a42;
+  --codex: #c084fc;
+  --codex-dim: #2e1a52;
+  --ok: #34d399;
+  --ok-dim: #0d3326;
+  --error: #f87171;
+  --error-dim: #3b1515;
+  --running: #fbbf24;
+  --running-dim: #3d2e00;
+  --queued: #4a4a5e;
+  --radius: 10px;
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+body {
+  font-family: -apple-system, 'Segoe UI', system-ui, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  min-height: 100vh;
+  padding: 28px 32px;
+}
+
+/* Header */
+.header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 28px;
+}
+
+.header h1 {
+  font-size: 22px;
+  font-weight: 700;
+  letter-spacing: -0.5px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.logo {
+  width: 32px; height: 32px;
+  background: linear-gradient(135deg, var(--accent), #f59e0b);
+  border-radius: 8px;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 18px;
+}
+
+.conn {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--text-dim);
+}
+
+.dot {
+  width: 8px; height: 8px;
+  border-radius: 50%;
+  background: var(--ok);
+  animation: pulse 2s ease-in-out infinite;
+}
+
+.dot.off {
+  background: var(--error);
+  animation: none;
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.3; }
+}
+
+/* Stats cards */
+.cards {
+  display: grid;
+  grid-template-columns: repeat(5, 1fr);
+  gap: 14px;
+  margin-bottom: 24px;
+}
+
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 18px 20px;
+  position: relative;
+  overflow: hidden;
+}
+
+.card::before {
+  content: '';
+  position: absolute;
+  top: 0; left: 0; right: 0;
+  height: 3px;
+}
+
+.card.total::before { background: var(--text-dim); }
+.card.running::before { background: var(--running); }
+.card.done::before { background: var(--ok); }
+.card.failed::before { background: var(--error); }
+.card.cost::before { background: var(--accent); }
+
+.card .label {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 1.2px;
+  color: var(--text-dim);
+  margin-bottom: 6px;
+}
+
+.card .value {
+  font-size: 30px;
+  font-weight: 800;
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+}
+
+.card.total .value { color: var(--text); }
+.card.running .value { color: var(--running); }
+.card.done .value { color: var(--ok); }
+.card.failed .value { color: var(--error); }
+.card.cost .value { color: var(--accent); font-size: 24px; }
+
+.card .sub {
+  font-size: 11px;
+  color: var(--text-dim);
+  margin-top: 4px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Progress */
+.progress-wrap { margin-bottom: 24px; }
+
+.progress-bar {
+  height: 4px;
+  background: var(--surface-2);
+  border-radius: 2px;
+  overflow: hidden;
+}
+
+.progress-fill {
+  height: 100%;
+  background: linear-gradient(90deg, var(--accent), var(--ok));
+  border-radius: 2px;
+  transition: width 0.6s cubic-bezier(0.4, 0, 0.2, 1);
+  position: relative;
+}
+
+.progress-fill::after {
+  content: '';
+  position: absolute;
+  top: 0; left: 0; right: 0; bottom: 0;
+  background: linear-gradient(90deg, transparent, rgba(255,255,255,0.15), transparent);
+  animation: shimmer 2s infinite;
+}
+
+@keyframes shimmer {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(100%); }
+}
+
+/* Table */
+.table-wrap {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+thead th {
+  text-align: left;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  color: var(--text-dim);
+  padding: 14px 18px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface-2);
+}
+
+thead th:nth-child(n+2) { text-align: center; }
+thead th:nth-child(5),
+thead th:nth-child(6) { text-align: right; }
+
+td {
+  padding: 12px 18px;
+  border-bottom: 1px solid var(--border);
+  font-size: 13px;
+}
+
+td:nth-child(n+2) { text-align: center; }
+td:nth-child(5), td:nth-child(6) { text-align: right; }
+
+tr:last-child td { border-bottom: none; }
+
+tr:hover td { background: var(--surface-3); }
+
+.task-name {
+  font-weight: 600;
+  font-size: 13px;
+}
+
+.spawned {
+  color: var(--text-dim);
+  padding-left: 18px;
+}
+
+.spawned::before {
+  content: "\21B3  ";
+  color: var(--accent);
+  font-weight: 400;
+}
+
+.backend {
+  font-weight: 600;
+  font-size: 12px;
+  padding: 2px 10px;
+  border-radius: 4px;
+  display: inline-block;
+}
+
+.backend-claude { color: var(--claude); background: var(--claude-dim); }
+.backend-codex { color: var(--codex); background: var(--codex-dim); }
+
+.badge {
+  display: inline-block;
+  padding: 3px 10px;
+  border-radius: 5px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.3px;
+}
+
+.badge-queued { background: var(--surface-3); color: var(--queued); }
+.badge-running {
+  background: var(--running-dim);
+  color: var(--running);
+  animation: pulse 1.5s ease-in-out infinite;
+}
+.badge-ok { background: var(--ok-dim); color: var(--ok); }
+.badge-error { background: var(--error-dim); color: var(--error); }
+.badge-timeout { background: var(--error-dim); color: var(--error); }
+
+.time {
+  font-variant-numeric: tabular-nums;
+  font-size: 13px;
+  font-family: 'SF Mono', 'Cascadia Code', 'JetBrains Mono', monospace;
+}
+
+.time.running { color: var(--running); }
+.time.ok { color: var(--ok); }
+.time.err { color: var(--error); }
+.time.dim { color: var(--text-muted); }
+
+.cost-cell {
+  font-variant-numeric: tabular-nums;
+  font-family: 'SF Mono', 'Cascadia Code', 'JetBrains Mono', monospace;
+  font-size: 13px;
+}
+
+.cost-cell.zero { color: var(--text-muted); }
+
+.empty-state {
+  text-align: center;
+  padding: 56px;
+  color: var(--text-dim);
+  font-size: 14px;
+}
+
+/* Footer */
+.footer {
+  margin-top: 20px;
+  text-align: center;
+  font-size: 11px;
+  color: var(--text-muted);
+  letter-spacing: 0.5px;
+}
+
+/* Responsive */
+@media (max-width: 768px) {
+  body { padding: 16px; }
+  .cards { grid-template-columns: repeat(2, 1fr); }
+  .card .value { font-size: 24px; }
+  .card.cost .value { font-size: 20px; }
+}
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>
+    <div class="logo">H</div>
+    Hive Dispatch
+  </h1>
+  <div class="conn">
+    <div class="dot off" id="dot"></div>
+    <span id="connText">Connecting...</span>
+  </div>
+</div>
+
+<div class="cards">
+  <div class="card total">
+    <div class="label">Total Tasks</div>
+    <div class="value" id="vTotal">0</div>
+    <div class="sub" id="vSpawned"></div>
+  </div>
+  <div class="card running">
+    <div class="label">Running</div>
+    <div class="value" id="vRunning">0</div>
+  </div>
+  <div class="card done">
+    <div class="label">Completed</div>
+    <div class="value" id="vDone">0</div>
+  </div>
+  <div class="card failed">
+    <div class="label">Failed</div>
+    <div class="value" id="vFailed">0</div>
+  </div>
+  <div class="card cost">
+    <div class="label">Total Cost</div>
+    <div class="value" id="vCost">$0.00</div>
+    <div class="sub" id="vCostBreak"></div>
+  </div>
+</div>
+
+<div class="progress-wrap">
+  <div class="progress-bar">
+    <div class="progress-fill" id="pbar" style="width:0%"></div>
+  </div>
+</div>
+
+<div class="table-wrap">
+  <table>
+    <thead>
+      <tr>
+        <th>Task</th>
+        <th>Backend</th>
+        <th>Model</th>
+        <th>Status</th>
+        <th>Time</th>
+        <th>Cost</th>
+      </tr>
+    </thead>
+    <tbody id="tbody"></tbody>
+  </table>
+</div>
+
+<div class="footer">Hive v0.3 &mdash; Live via SSE</div>
+
+<script>
+const $ = id => document.getElementById(id);
+
+function render(data) {
+  const tasks = data.tasks || {};
+  const costs = data.costs || {};
+  const entries = Object.entries(tasks);
+  const now = Date.now() / 1000;
+
+  // Counts
+  let running = 0, done = 0, failed = 0, spawned = 0;
+  for (const [, t] of entries) {
+    const s = t.status;
+    if (s === 'running') running++;
+    else if (s === 'ok') done++;
+    else if (s === 'error' || s === 'timeout' || s === 'exception') failed++;
+    if (t.spawned_by) spawned++;
+  }
+
+  const total = costs.tasks_total || entries.length;
+
+  $('vTotal').textContent = total;
+  $('vSpawned').textContent = spawned > 0 ? spawned + ' spawned' : '';
+  $('vRunning').textContent = running;
+  $('vDone').textContent = done;
+  $('vFailed').textContent = failed;
+
+  const claudeCost = costs.claude || 0;
+  const codexCost = costs.codex || 0;
+  const totalCost = claudeCost + codexCost;
+  $('vCost').textContent = '$' + totalCost.toFixed(4);
+
+  const parts = [];
+  if (claudeCost > 0) parts.push('Claude $' + claudeCost.toFixed(4));
+  if (codexCost > 0) parts.push('Codex $' + codexCost.toFixed(4));
+  $('vCostBreak').textContent = parts.join(' / ');
+
+  // Progress
+  const pct = total > 0 ? ((done + failed) / total) * 100 : 0;
+  $('pbar').style.width = pct.toFixed(1) + '%';
+
+  // Table
+  const rows = [];
+  for (const [name, t] of entries) {
+    const s = t.status || 'queued';
+    const backend = t.backend || '?';
+    const model = t.model || '-';
+    const cost = t.cost_usd || 0;
+    const elapsed = t.elapsed_s || 0;
+    const start = t.start_time || 0;
+    const isSpawned = !!t.spawned_by;
+
+    const nameHtml = isSpawned
+      ? '<span class="task-name spawned">' + esc(name) + '</span>'
+      : '<span class="task-name">' + esc(name) + '</span>';
+
+    const backendCls = 'backend backend-' + backend;
+
+    let badgeCls, badgeTxt;
+    switch (s) {
+      case 'queued':  badgeCls = 'badge-queued';  badgeTxt = 'QUEUED'; break;
+      case 'running': badgeCls = 'badge-running'; badgeTxt = 'RUNNING'; break;
+      case 'ok':      badgeCls = 'badge-ok';      badgeTxt = 'DONE'; break;
+      case 'error': case 'exception':
+                      badgeCls = 'badge-error';   badgeTxt = 'ERROR'; break;
+      case 'timeout': badgeCls = 'badge-timeout'; badgeTxt = 'TIMEOUT'; break;
+      default:        badgeCls = 'badge-error';   badgeTxt = s.toUpperCase();
+    }
+
+    let timeCls = 'time dim', timeTxt = '-';
+    if (s === 'running' && start) {
+      timeCls = 'time running';
+      timeTxt = Math.round(now - start) + 's';
+    } else if (s === 'ok') {
+      timeCls = 'time ok';
+      timeTxt = elapsed.toFixed(1) + 's';
+    } else if (s === 'error' || s === 'timeout' || s === 'exception') {
+      timeCls = 'time err';
+      timeTxt = elapsed ? elapsed.toFixed(1) + 's' : '-';
+    }
+
+    const costCls = cost > 0 ? 'cost-cell' : 'cost-cell zero';
+    const costTxt = cost > 0 ? '$' + cost.toFixed(4) : '-';
+
+    rows.push(
+      '<tr>' +
+        '<td>' + nameHtml + '</td>' +
+        '<td><span class="' + backendCls + '">' + esc(backend) + '</span></td>' +
+        '<td>' + esc(model || '-') + '</td>' +
+        '<td><span class="badge ' + badgeCls + '">' + badgeTxt + '</span></td>' +
+        '<td class="' + timeCls + '">' + timeTxt + '</td>' +
+        '<td class="' + costCls + '">' + costTxt + '</td>' +
+      '</tr>'
+    );
+  }
+
+  $('tbody').innerHTML = rows.join('') ||
+    '<tr><td colspan="6" class="empty-state">Waiting for tasks...</td></tr>';
+}
+
+function esc(s) {
+  const d = document.createElement('div');
+  d.textContent = s;
+  return d.innerHTML;
+}
+
+// SSE
+let es;
+function connect() {
+  es = new EventSource('/api/events');
+  es.onmessage = e => {
+    try {
+      render(JSON.parse(e.data));
+      $('dot').className = 'dot';
+      $('connText').textContent = 'Live';
+    } catch (err) { /* ignore parse errors */ }
+  };
+  es.onerror = () => {
+    $('dot').className = 'dot off';
+    $('connText').textContent = 'Reconnecting...';
+    es.close();
+    setTimeout(connect, 2000);
+  };
+}
+
+connect();
+
+// Tick running timers every second
+setInterval(() => {
+  const rows = document.querySelectorAll('.badge-running');
+  rows.forEach(badge => {
+    const tr = badge.closest('tr');
+    if (!tr) return;
+    const cell = tr.querySelector('.time.running');
+    if (!cell) return;
+    const txt = cell.textContent;
+    if (txt.endsWith('s')) {
+      cell.textContent = (parseInt(txt) + 1) + 's';
+    }
+  });
+}, 1000);
+</script>
+</body>
+</html>
