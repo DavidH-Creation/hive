@@ -1,69 +1,65 @@
 # Hive
 
-Multi-agent task dispatcher for Claude CLI + OpenAI Codex CLI with a live Rich TUI dashboard.
+Multi-agent task dispatcher for Claude CLI + OpenAI Codex CLI with live Rich TUI dashboard and web monitoring.
 
-```
-You (plan) --> tasks/*.md --> dispatch.py --> results/*.json --> You (review)
-```
+[![CI](https://github.com/DavidH-Creation/hive/actions/workflows/ci.yml/badge.svg)](https://github.com/DavidH-Creation/hive/actions/workflows/ci.yml)
 
-## Quick start
+## Overview
+
+Hive breaks complex tasks into parallel subtasks and dispatches them across multiple AI backends (Claude CLI and Codex CLI). Monitor progress through a Rich TUI dashboard or web interface.
+
+Part of the [Forge Platform](https://github.com/DavidH-Creation/forge-platform) ecosystem — complements Cartographer (planning) and Bulwark (execution) for parallel lightweight subtask dispatch.
+
+## Features
+
+- **Multi-backend dispatch**: Claude CLI (haiku/sonnet/opus) + Codex CLI (gpt-5.4/gpt-5.3-codex)
+- **Rich TUI dashboard**: Real-time progress, status indicators, and result summaries
+- **Web dashboard** (v0.3): Browser-based monitoring at configurable port
+- **Dynamic task spawning** (v0.3): Agents can spawn subtasks via `HIVE_SPAWN:` stdout protocol
+- **Git worktree isolation** (v0.3): Each task runs in an isolated worktree copy
+- **Priority-based batch execution**: Lower priority number = runs first; same priority = parallel
+- **YAML frontmatter task format**: Configure backend, model, difficulty, priority, timeout per task
+- **JSON result persistence**: All results saved for post-run analysis
+
+## Usage
 
 ```bash
-git clone https://github.com/DavidH-Creation/hive.git
-cd hive
-pip install rich
-python dispatch.py        # run all tasks in tasks/
-python dispatch.py 3      # limit to 3 concurrent
+python dispatch.py                          # all tasks, full parallelism
+python dispatch.py --workers 3              # limit concurrency
+python dispatch.py --tasks-dir ./my         # custom task directory
+python dispatch.py --results-dir ./out      # custom results directory
+python dispatch.py --web                    # enable web dashboard
+python dispatch.py --web --port 9090        # custom port
+python dispatch.py --worktree              # enable git worktree isolation
 ```
 
-## Task format
+## Task Format
 
-Create `.md` files in `tasks/` with optional YAML frontmatter:
+Tasks are Markdown files in `tasks/` with optional YAML frontmatter:
 
 ```markdown
 ---
-backend: claude
-model: sonnet
-difficulty: medium
-priority: 1
-timeout: 300
+backend: claude | codex
+model: haiku | sonnet | opus | gpt-5.4 | gpt-5.3-codex
+difficulty: low | medium | high
+priority: 1          # lower = runs first, same priority = parallel
+timeout: 300         # seconds, default 600
+worktree: true       # run in isolated git worktree
 ---
-Your prompt here. Be specific — include file paths and context.
+Your prompt here...
 ```
 
-| Field | Default | Options |
-|-------|---------|---------|
-| backend | claude | `claude`, `codex` |
-| model | (default) | Claude: `haiku`/`sonnet`/`opus` — Codex: `gpt-5.4`/`gpt-5.3-codex` |
-| difficulty | - | `low`/`medium`/`high` (shown in dashboard) |
-| priority | 99 | Lower = runs first |
-| timeout | 600 | Seconds |
+## Dynamic Task Spawning
 
-See `tasks/examples/` for sample task files.
-
-## Dashboard
+Agents can spawn new tasks by printing to stdout:
 
 ```
-+----------------------- Hive Dispatch ------------------------+
-| Task            | Back  | Model  | Status  | Time  | Cost    |
-|-----------------+-------+--------+---------+-------+---------|
-| review-code     | claude| sonnet | OK done | 18.0s | $0.0396 |
-| write-tests     | claude| haiku  | >> run  |   5s  | -       |
-| codex-task      | codex | gpt5.4 | OK done |  8.6s | -       |
-+---------------------------------------------------------------+
-         2/3 done  |  Claude: $0.0396  |  Total: $0.0396
+HIVE_SPAWN: {"name": "sub-task", "prompt": "...", "backend": "claude"}
 ```
 
-## Use as a Claude Code skill
+## Claude Code Skill
 
-Copy the `hive/` directory into your Claude Code skills path. The skill triggers when you ask to dispatch parallel tasks, fan out work, or mention "hive". See `SKILL.md` for the full workflow.
-
-## Requirements
-
-- Python 3.10+
-- [rich](https://github.com/Textualize/rich) (`pip install rich`)
-- [Claude CLI](https://docs.anthropic.com/en/docs/claude-code) on PATH
-- [Codex CLI](https://github.com/openai/codex) on PATH (optional, for Codex backend tasks)
+Hive is also available as a Claude Code skill installed at `~/.claude/skills/hive/`.
 
 ## License
 
